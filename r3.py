@@ -1,160 +1,225 @@
 import asyncio
+import psycopg2
 import logging
-from collections import defaultdict
-from queue import Queue
-from typing import List, Tuple
-import asyncpg
+import json
+from psycopg2 import sql
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from logging.handlers import RotatingFileHandler
 
-# Configure main logging
-logging.basicConfig(filename='progress.log', level=logging.INFO, format='%(asctime)s %(message)s')
-logger = logging.getLogger('MainLogger')
+# Dictionary to track each server's availability status
+server_status = {}
 
-# Function to setup database-specific logger
-def setup_db_logger(db_name: str):
-    db_logger = logging.getLogger(db_name)
-    handler = logging.FileHandler(f'{db_name}_progress.log')
-    formatter = logging.Formatter('%(asctime)s %(message)s')
-    handler.setFormatter(formatter)
-    db_logger.addHandler(handler)
-    db_logger.setLevel(logging.INFO)
-    return db_logger
+# Create loggers
+main_logger = logging.getLogger("MainLogger")
+individual_loggers = {}
 
-class IndexReindexer:
-    def __init__(self, server_db_list: List[Tuple[str, str]], max_servers: int, max_tables: int, db_config: dict):
-        self.server_db_list = server_db_list
-        self.max_servers = max_servers
-        self.max_tables = max_tables
-        self.db_config = db_config
-        self.server_queue = Queue()
-        self.in_progress_servers = set()
-        self.db_loggers = {}
+# Main log file setup
+main_handler = RotatingFileHandler('main_log.json', maxBytes=5 * 1024 * 1024, backupCount=3)
+main_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))  # Include timestamp in logs
+main_logger.addHandler(main_handler)
+main_logger.setLevel(logging.INFO)
 
-        # Initialize server queue with server-database pairs
-        self._initialize_server_queue()
 
-    def _initialize_server_queue(self):
-        """ Initialize the server queue with server-database pairs. """
-        for server, db in self.server_db_list:
-            self.server_queue.put((server, db))
+# Function to create and get individual database loggers
+def get_individual_logger(host, dbname):
+    log_filename = f"{host}_{dbname}_database_log.json"
+    if log_filename not in individual_loggers:
+        # Create individual log files for each database
+        handler = RotatingFileHandler(log_filename, maxBytes=5 * 1024 * 1024, backupCount=3)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))  # Include timestamp in logs
+        logger = logging.getLogger(f"{host}_{dbname}Logger")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        individual_loggers[log_filename] = logger
+    return individual_loggers[log_filename]
 
-    async def _get_index_names(self, conn, table_name: str) -> List[str]:
-        """ Retrieve index names for a specific table. """
-        query = """
-        SELECT indexname
-        FROM pg_indexes
-        WHERE schemaname = 'public' AND tablename = $1;
-        """
-        indexes = await conn.fetch(query, table_name)
-        return [index['indexname'] for index in indexes]
 
-    async def _reindex_index(self, conn, db_logger, index_name: str):
-        """ Reindex an index concurrently. """
-        db_logger.info(f"Started reindexing index {index_name} CONCURRENTLY")
-        try:
-            await conn.execute(f"REINDEX INDEX CONCURRENTLY {index_name};")
-            db_logger.info(f"Finished reindexing index {index_name} CONCURRENTLY")
-        except Exception as e:
-            db_logger.error(f"Error reindexing index {index_name} CONCURRENTLY: {e}")
+def is_server_available(host):
+    """Check if a server is available for processing."""
+    return server_status.get(host, True)
 
-    async def _reindex_table(self, conn, db_logger, table_name: str):
-        """ Reindex all indexes for a table concurrently. """
-        db_logger.info(f"Started reindexing indexes in table {table_name}")
-        index_names = await self._get_index_names(conn, table_name)
 
-        # Reindex all indexes concurrently
-        tasks = [self._reindex_index(conn, db_logger, index_name) for index_name in index_names]
-        await asyncio.gather(*tasks)
-        db_logger.info(f"Finished reindexing all indexes in table {table_name}")
+def set_server_status(host, status):
+    """Set the server's processing status."""
+    server_status[host] = status
 
-    async def _reindex_database(self, server: str, db_name: str):
-        """ Reindex all tables in the database concurrently. """
-        db_logger = self.db_loggers[db_name]
-        db_logger.info(f"Started reindexing database {db_name} on server {server}")
 
-        # Establish connection to the PostgreSQL database
-        db_config = self.db_config.get(server, {})
-        conn = await asyncpg.connect(**db_config, database=db_name)
+def get_top_10_tables(conn):
+    """
+    Fetch the top 10 largest tables by size.
+    """
+    query = """
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+        ORDER BY pg_total_relation_size(quote_ident(tablename)) DESC
+        LIMIT 10;
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(query)
+        tables = [row[0] for row in cursor.fetchall()]
+    return tables
 
-        try:
-            # Fetch table names from the database
-            tables = await conn.fetch("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';")
-            table_names = [table['table_name'] for table in tables]
 
-            # Limit to max_tables and reindex each table concurrently
-            tasks = [self._reindex_table(conn, db_logger, table_name) for table_name in table_names[:self.max_tables]]
-            await asyncio.gather(*tasks)
+def reindex_table(conn, table, host, dbname, index, total_tables, logger):
+    """
+    Perform reindex on a single table and log progress immediately after reindexing.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(sql.SQL("REINDEX TABLE {};").format(sql.Identifier(table)))
+    conn.commit()
 
-            db_logger.info(f"Finished reindexing database {db_name} on server {server}")
+    # Log each table being processed in the individual database log
+    logger.info(json.dumps({
+        "event": "TableReindexed",
+        "host": host,
+        "dbname": dbname,
+        "table": table,
+        "table_index": index,
+        "total_tables": total_tables
+    }))
 
-        finally:
-            await conn.close()
+    # Log the progress in the main log
+    main_logger.info(json.dumps({
+        "event": "Progress",
+        "host": host,
+        "dbname": dbname,
+        "table": table,
+        "processed_tables": index,
+        "total_tables": total_tables,
+        "progress_percentage": (index / total_tables) * 100
+    }))
 
-    async def _process_database(self, server: str, db_name: str):
-        """ Process the reindexing for a single database. """
-        db_logger = self.db_loggers.get(db_name) or setup_db_logger(db_name)
-        self.db_loggers[db_name] = db_logger
 
-        # Run the reindexing for the database
-        await self._reindex_database(server, db_name)
+def process_server(server_config):
+    """
+    Connect to the server, fetch the top 10 tables, and reindex them.
+    """
+    host = server_config['host']
+    dbname = server_config['dbname']
+    if not is_server_available(host):
+        return False  # Server is busy
 
-    async def _process_server_queue(self):
-        """ Process databases from the server queue. """
-        while not self.server_queue.empty():
-            server, db_name = self.server_queue.get()
+    set_server_status(host, False)  # Mark server as busy
+    logger = get_individual_logger(host, dbname)  # Get the logger for the individual server
 
-            if server in self.in_progress_servers:
-                logger.info(f"Server {server} is busy, re-queuing database {db_name}")
-                self.server_queue.put((server, db_name))
-                await asyncio.sleep(1)  # Avoid tight loop
-            else:
-                self.in_progress_servers.add(server)
-                logger.info(f"Processing database {db_name} on server {server}")
+    try:
+        # Connect to the database
+        conn = psycopg2.connect(**server_config)
+        tables = get_top_10_tables(conn)
 
-                # Process the database
-                await self._process_database(server, db_name)
+        if not tables:
+            return True  # No tables to reindex
 
-                # After processing, mark server as not in progress
-                self.in_progress_servers.remove(server)
-                logger.info(f"Finished processing database {db_name} on server {server}")
+        total_tables = len(tables)
 
-    async def start_processing(self):
-        """ Start processing the queue with max_servers concurrently. """
-        tasks = [self._process_server_queue() for _ in range(self.max_servers)]
-        await asyncio.gather(*tasks)
+        # Log the start of the reindexing process
+        main_logger.info(json.dumps({
+            "event": "ReindexingStarted",
+            "host": host,
+            "dbname": dbname,
+            "total_tables": total_tables
+        }))
 
-# Main function to initialize and run the reindexer
-async def main():
-    # Sample list of (server, database) pairs
-    server_db_list = [
-        ('server1', 'db1'), ('server1', 'db2'),
-        ('server2', 'db3'), ('server2', 'db4'),
-        ('server3', 'db5'), ('server3', 'db6')
-    ]
-    
-    # PostgreSQL database connection configurations
-    db_config = {
-        'server1': {
-            'user': 'your_user',
-            'password': 'your_password',
-            'host': 'your_host',
-            'port': 5432
-        },
-        'server2': {
-            'user': 'your_user',
-            'password': 'your_password',
-            'host': 'your_host',
-            'port': 5432
-        },
-        'server3': {
-            'user': 'your_user',
-            'password': 'your_password',
-            'host': 'your_host',
-            'port': 5432
-        }
+        # Create a thread pool for reindexing tables concurrently
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for index, table in enumerate(tables, start=1):
+                # Submit reindexing task for each table to the thread pool
+                futures.append(executor.submit(reindex_table, conn, table, host, dbname, index, total_tables, logger))
+
+            # Wait for all threads to finish and log any exceptions if any occurred
+            for future in as_completed(futures):
+                future.result()  # This ensures exceptions are raised if any occurred
+
+        return True
+    except Exception as e:
+        return False
+    finally:
+        conn.close()
+        set_server_status(host, True)  # Mark server as available again
+
+
+async def reindex_servers_parallel(server_list):
+    """
+    Process a list of servers, reindexing two servers at a time.
+    If a server is busy, it is re-queued.
+    """
+    server_queue = asyncio.Queue()
+    for server in server_list:
+        await server_queue.put(server)
+        main_logger.info(json.dumps({
+            "event": "ServerQueued",
+            "host": server['host'],
+            "dbname": server['dbname']
+        }))
+
+    semaphore = asyncio.Semaphore(2)  # Limit to 2 concurrent server tasks
+
+    # Define a ThreadPoolExecutor for running synchronous functions concurrently
+    with ThreadPoolExecutor() as executor:
+
+        async def worker():
+            while not server_queue.empty():
+                server_config = await server_queue.get()
+                host = server_config['host']
+                dbname = server_config['dbname']
+
+                # Acquire the semaphore to ensure only 2 servers run at a time
+                async with semaphore:
+                    loop = asyncio.get_running_loop()
+                    # Process the server using the thread pool
+                    success = await loop.run_in_executor(executor, process_server, server_config)
+
+                    if not success:
+                        await server_queue.put(server_config)  # Re-queue the server if it was busy
+
+                server_queue.task_done()
+
+        # Start the worker tasks
+        num_workers = 2
+        main_logger.info(json.dumps({
+            "event": "WorkerTasksStarting",
+            "workers": num_workers
+        }))
+
+        tasks = [asyncio.create_task(worker()) for _ in range(num_workers)]
+        await server_queue.join()
+
+        # Cancel tasks once queue is empty and all tasks are completed
+        for task in tasks:
+            task.cancel()
+
+    main_logger.info(json.dumps({
+        "event": "AllServersProcessed"
+    }))
+
+
+# Example server configuration
+servers = [
+    {
+        'dbname': 'demo1',
+        'user': 'demo',
+        'password': 'demo',
+        'host': 'localhost',
+        'port': '5432'
+    },
+    {
+        'dbname': 'demo2',
+        'user': 'demo',
+        'password': 'demo',
+        'host': 'localhost',
+        'port': '5432'
+    },
+   {
+        'dbname': 'demo3',
+        'user': 'demo',
+        'password': 'demo',
+        'host': 'localhost',
+        'port': '5432'
     }
-    
-    reindexer = IndexReindexer(server_db_list, max_servers=2, max_tables=2, db_config=db_config)
-    await reindexer.start_processing()
 
-# Run the main function
-asyncio.run(main())
+]
+
+# Start reindexing
+asyncio.run(reindex_servers_parallel(servers))
